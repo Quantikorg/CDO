@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDO Monte Carlo Pricer</title>
+<style>
+body { font-family: 'Inter', sans-serif; background: #f5f7fa; margin: 0; padding: 2rem; color: #111; }
+h1 { text-align:center }
+.container { max-width:1100px; margin:0 auto; background:white; padding:1.5rem; border-radius:12px; box-shadow:0 6px 24px rgba(0,0,0,0.08);} 
+label{display:block;font-weight:600;margin-top:0.5rem}
+input, textarea { padding:0.5rem 0.75rem; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; width:100%; background:#fff9c4; color:#b91c1c; font-weight:600; }
+input:focus, textarea:focus { outline:none; border:1px solid #f97316; box-shadow:0 0 0 2px rgba(249,115,22,0.2); }
+button{background:linear-gradient(90deg,#f97316,#4f46e5);border:none;padding:12px;border-radius:10px;color:white;font-weight:600;cursor:pointer;width:100%}
+.controls{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1rem;align-items:end}
+.table { margin-top:20px; width:100%; border-collapse: collapse; }
+.table th, .table td { border:1px solid #ddd; padding:8px; text-align:center; }
+.section { margin-top:1.5rem }
+.disclaimer {margin-top:1rem; font-size:0.9rem; color:#666; font-style:italic;}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Estimating CDOs Expected Losses via a Monte Carlo Simulation</h1>
+
+<div class="section" style="background:#f9fafb;border:1px solid #eee;padding:1rem;border-radius:10px;">
+<h3 style="margin-top:0">Model Overview</h3>
+<div style="font-family:monospace; font-size:0.95rem; line-height:1.6; color:#333">
+<b>Default Model:</b><br>
+PD_i = 1 - exp(-λ_i T), &nbsp; λ_i = Spread / (1 - Recovery)<br><br>
+
+<b>Gaussian Copula:</b><br>
+X_i = √ρ · F + √(1-ρ) · ε_i<br>
+F, ε_i ~ N(0,1)<br><br>
+
+<b>Default Trigger:</b><br>
+Default if X_i &lt; Φ⁻¹(PD_i)<br><br>
+
+<b>Portfolio Loss:</b><br>
+L = Σ (LGD_i · Notional_i · 1_{default}) / Total Notional<br><br>
+
+<b>Tranche Loss:</b><br>
+L_tranche = min(max((L - A)/(D - A), 0), 1)
+</div>
+</div>
+
+<div class="controls">
+<div>
+<label>Iterations</label>
+<input id="iterations" value="10,000">
+</div>
+<div>
+<label>Correlation (ρ)</label>
+<input id="rho" type="number" step="0.01" value="0.2">
+</div>
+<div>
+<label>Time Horizon (years)</label>
+<input id="T" type="number" value="5">
+</div>
+</div>
+
+<div class="section">
+<label>Portfolio (Spread, Recovery, Notional)</label>
+<textarea id="portfolio" rows="5">0.02,0.4,1
+0.03,0.4,1
+0.01,0.4,1</textarea>
+</div>
+
+<div class="section">
+<label>Tranches (Attach, Detach)</label>
+<textarea id="tranches" rows="4">0,0.03
+0.03,0.06
+0.06,0.1
+0.1,1</textarea>
+</div>
+
+<div class="section">
+<button onclick="runSimulation()">Run Simulation</button>
+
+</div>
+
+<div class="section">
+<h3>Results</h3>
+<table class="table" id="results">
+<thead><tr><th>Tranche</th><th>PD</th><th>Expected Loss</th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+<div class="section">
+<h3>Monte Carlo Diagnostics</h3>
+<table class="table" id="diag">
+<thead><tr><th>Metric</th><th>Value</th><th>Target</th></tr></thead>
+<tbody></tbody>
+</table>
+</div>
+
+<div class="disclaimer">⚠️ Educational model. Results depend on assumptions (Gaussian copula, constant recovery, etc.).</div>
+</div>
+
+<script>
+function randn() {
+    let u = 0, v = 0;
+    while(u === 0) u = Math.random();
+    while(v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// format number with commas
+function formatNumber(n){ return Number(n).toLocaleString(); }
+
+// apply formatting to iterations input
+const iterInput = document.getElementById('iterations');
+iterInput.addEventListener('input', (e)=>{
+    let value = e.target.value.replace(/,/g,'');
+    if(!isNaN(value) && value.length > 0){
+        e.target.value = Number(value).toLocaleString();
+    }
+});
+
+function runSimulation() {
+    const iterations = parseInt(document.getElementById("iterations").value.replace(/,/g,''));
+    const rho = parseFloat(document.getElementById("rho").value);
+    const T = parseFloat(document.getElementById("T").value);
+
+    const w1 = Math.sqrt(rho);
+    const w2 = Math.sqrt(1 - rho);
+
+    const portfolio = document.getElementById("portfolio").value.trim().split("\n").map(l => l.split(",").map(Number));
+    const tranches = document.getElementById("tranches").value.trim().split("\n").map(l => l.split(",").map(Number));
+
+    const nLoans = portfolio.length;
+    const nTranches = tranches.length;
+
+    let PD = new Array(nLoans);
+    let LGD = new Array(nLoans);
+    let notional = new Array(nLoans);
+
+    let totalNotional = 0;
+
+    for (let i=0;i<nLoans;i++) {
+        const spread = portfolio[i][0];
+        const recovery = portfolio[i][1];
+        const N = portfolio[i][2];
+
+        const lambda = spread / (1 - recovery);
+        PD[i] = 1 - Math.exp(-lambda * T);
+        LGD[i] = 1 - recovery;
+        notional[i] = N;
+        totalNotional += N;
+    }
+
+    let thresholds = PD.map(p => inverseNormal(p));
+
+    let tranchePD = new Array(nTranches).fill(0);
+    let trancheEL = new Array(nTranches).fill(0);
+
+    let sumF = 0, sumF2 = 0;
+    let sumXiXi1 = 0, countXi = 0;
+
+    for (let it=0; it<iterations; it++) {
+        const factor = randn();
+        sumF += factor;
+        sumF2 += factor * factor;
+
+        let loss = 0;
+        let prevXi = null;
+
+        for (let i=0;i<nLoans;i++) {
+            const xi = w1 * factor + w2 * randn();
+
+            if (prevXi !== null) {
+                sumXiXi1 += xi * prevXi;
+                countXi++;
+            }
+            prevXi = xi;
+
+            if (xi < thresholds[i]) {
+                loss += LGD[i] * notional[i];
+            }
+        }
+
+        loss /= totalNotional;
+
+        for (let t=0;t<nTranches;t++) {
+            const A = tranches[t][0];
+            const D = tranches[t][1];
+
+            if (loss > A) {
+                let trancheLoss = (loss - A) / (D - A);
+                if (trancheLoss > 1) trancheLoss = 1;
+
+                tranchePD[t] += 1/iterations;
+                trancheEL[t] += trancheLoss/iterations;
+            }
+        }
+    }
+
+    const tbody = document.querySelector("#results tbody");
+    tbody.innerHTML = "";
+
+    for (let t=0;t<nTranches;t++) {
+        const row = `<tr><td>${tranches[t][0]}-${tranches[t][1]}</td><td>${(tranchePD[t]*100).toFixed(2)}%</td><td>${(trancheEL[t]*100).toFixed(2)}%</td></tr>`;
+        tbody.innerHTML += row;
+    }
+
+    const meanF = sumF / iterations;
+    const varF = sumF2 / iterations - meanF * meanF;
+    const covApprox = sumXiXi1 / countXi;
+
+    const diagBody = document.querySelector("#diag tbody");
+    diagBody.innerHTML = "";
+
+    diagBody.innerHTML += `<tr><td>Factor Mean</td><td>${meanF.toFixed(4)}</td><td>0</td></tr>`;
+    diagBody.innerHTML += `<tr><td>Factor Variance</td><td>${varF.toFixed(4)}</td><td>1</td></tr>`;
+    diagBody.innerHTML += `<tr><td>Empirical Correlation</td><td>${covApprox.toFixed(4)}</td><td>${rho}</td></tr>`;
+}
+
+function inverseNormal(p) {
+    return Math.sqrt(2) * erfinv(2*p - 1);
+}
+
+function erfinv(x) {
+    let a = 0.147;
+    let ln = Math.log(1 - x*x);
+    let first = 2/(Math.PI*a) + ln/2;
+    let second = ln/a;
+    return Math.sign(x)*Math.sqrt(Math.sqrt(first*first - second) - first);
+}
+</script>
+<footer style="margin:40px auto 20px;max-width:920px;text-align:center;font-size:12px;color:#777;font-style:italic;">
+© Quantik.org. All rights reserved. This model, including its code and associated intellectual property, is the exclusive property of Quantik.org and may not be copied, distributed, or replicated without prior written consent. Use of this calculator implies acceptance of these terms.
+</footer>
+</body>
+</html>
